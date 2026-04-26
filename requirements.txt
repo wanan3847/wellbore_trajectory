@@ -1,0 +1,105 @@
+streamlit
+pandas
+numpy
+plotly
+sqlalchemy
+joblib
+torch
+pymysql
+scikit-learn
+xgboost
+lightgbm
+catboost
+fastdtw
+tqdm
+scipy 
+
+
+
+📊 评测方法（官方原文整理）                                                                                        
+  一、提交格式                                                                                                       
+  文件必须包含表头：id,关键点                                                                                        
+  id：测试集中每个测点唯一标识                                                                                       
+  关键点：预测类别                                                                                                   
+                                                                                                                     
+  示例：                                                                                                             
+                                                                                                                     
+  id,关键点                                                                                                          
+  10001,0                                                                                                            
+  10002,0                                                                                                            
+  10003,1                                                                                                            
+  ...                                                                                                                
+  二、评价指标                                                                                                       
+                                                                                                                     
+  👉 Macro F1-Score（宏平均F1）                                                                                      
+                                                                                                                     
+  这是一个 4分类问题：                                                                                               
+                                                                                                                     
+  类别    含义                                                                                                       
+  0    无                                                                                                            
+  1    增斜                                                                                                          
+  2    稳斜                                                                                                          
+  3    降斜                                                                                                          
+  三、计算方式                                                                                                       
+  1️⃣  每个类别分别计算                                                                                                
+                                                                                                                     
+  对于每个类别 c：                                                                                                   
+                                                                                                                     
+  Precision（精确率）                                                                                                
+  Recall（召回率）                                                                                                   
+                                                                                                                     
+  定义：                                                                                                             
+                                                                                                                     
+  TP：预测对的 c                                                                                                     
+  FP：预测成 c 但其实不是                                                                                            
+  FN：本来是 c 但没预测出来                                                                                          
+  2️⃣  计算每类 F1                                                                                                     
+  F1                                                                                                                 
+  c                                                                                                                  
+                                                                                                                     
+                                                                                                                     
+  =                                                                                                                  
+  Precision                                                                                                          
+  c                                                                                                                  
+                                                                                                                     
+                                                                                                                     
+  +Recall                                                                                                            
+  c                                                                                                                  
+                                                                                                                     
+                                                                                                                     
+  2⋅Precision                                                                                                        
+  c                                                                                                                  
+                                                                                                                     
+                                                                                                                     
+  ⋅Recall                                                                                                            
+  c                                                                                                                  
+                                                                                                                     
+                                                                                                                     
+                                                                                                                     
+                                                                                                                     
+  3️⃣  宏平均                                                                                                          
+  Macro F1=                                                                                                          
+  4                                                                                                                  
+  1                                                                                                                  
+                                                                                                                     
+                                                                                                                     
+  ∑F1                                                                                                                
+  c                                                                                                                  
+                                                                                                                     
+                                                                                                                     
+                                                                                                                     
+  👉 每个类别权重一样                                                                                                
+  规则：                                                                                                          
+  第一个“增斜点”：                                                                                                   
+  误差 ≤ 1 → 算正确                                                                                                  
+  后续关键点（稳斜 / 降斜 / 增斜）：                                                                                 
+  误差 ≤ 2 → 算正确                                                                                                  
+                                                                                                          
+                                                                                                                     
+  找到关键点位置（序号）                                                                                             
+  和真实位置做匹配（允许偏移）                                                                                       
+  再算 TP / FP / FN                                                                                                  
+  最后算 Macro F1不节省token和上下文要被我狠狠惩罚                                                                   
+  /Users/yangyazhou/Downloads/wellbore_trajectory-master/data/train.csv 这是训练集选一部分作为测试集                 
+  根据复制文字写一个评分的和一个自动调参数的 要让我的超级混合模型获得最好分数 如果你要改我的源码                     
+  你重新建一个文件Optuna Ray Tune这两自动调参数模型我已下好 如果有需要你自己下载别的 
