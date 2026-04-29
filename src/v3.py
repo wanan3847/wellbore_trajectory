@@ -410,15 +410,16 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
     val_f1_list = []
 
     default_xgb = {
-        'n_estimators': 1000, 'max_depth': 16, 'learning_rate': 0.05,
+        'n_estimators': 500, 'max_depth': 16, 'learning_rate': 0.05,
         'subsample': 0.8, 'colsample_bytree': 0.8,
         'eval_metric': 'mlogloss', 'use_label_encoder': False,
         'random_state': random_seed, 'verbosity': 0, 'n_jobs': -1,
+        'early_stopping_rounds': 20,
     }
     default_xgb.update(tree_params.get('xgb', {}))
 
     default_lgb = {
-        'n_estimators': 1000, 'num_leaves': 31, 'learning_rate': 0.05,
+        'n_estimators': 500, 'num_leaves': 31, 'learning_rate': 0.05,
         'subsample': 0.8, 'colsample_bytree': 0.8,
         'class_weight': {0: 1, 1: 128, 2: 192, 3: 512},
         'random_state': random_seed, 'verbose': -1, 'n_jobs': -1,
@@ -426,7 +427,7 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
     default_lgb.update(tree_params.get('lgb', {}))
 
     default_cat = {
-        'n_estimators': 1000, 'depth': 11, 'learning_rate': 0.05,
+        'n_estimators': 500, 'depth': 11, 'learning_rate': 0.05,
         'class_weights': {0: 1, 1: 128, 2: 192, 3: 512},
         'random_seed': random_seed, 'verbose': False,
     }
@@ -449,7 +450,7 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
 
         # XGBoost
         model_xgb = xgb.XGBClassifier(**default_xgb)
-        model_xgb.fit(X_tr_s, y_tr, eval_set=[(X_val_s, y_val)], early_stopping_rounds=50, verbose=False)
+        model_xgb.fit(X_tr_s, y_tr, eval_set=[(X_val_s, y_val)])
         pred_xgb = model_xgb.predict_proba(X_val_s)
         oof_preds['xgb'][val_rows] = np.argmax(pred_xgb, axis=1)
         oof_preds_4c['xgb'][val_rows] = pred_xgb
@@ -457,7 +458,7 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
 
         # LightGBM
         model_lgb = lgb.LGBMClassifier(**default_lgb)
-        model_lgb.fit(X_tr_s, y_tr, eval_set=[(X_val_s, y_val)], callbacks=[lgb.early_stopping(50)], verbose=False)
+        model_lgb.fit(X_tr_s, y_tr, eval_set=[(X_val_s, y_val)], callbacks=[lgb.early_stopping(20)])
         pred_lgb = model_lgb.predict_proba(X_val_s)
         oof_preds['lgb'][val_rows] = np.argmax(pred_lgb, axis=1)
         oof_preds_4c['lgb'][val_rows] = pred_lgb
@@ -465,7 +466,7 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
 
         # CatBoost
         model_cat = cb.CatBoostClassifier(**default_cat)
-        model_cat.fit(X_tr_s, y_val, eval_set=(X_val_s, y_val), early_stopping_rounds=50, verbose=False)
+        model_cat.fit(X_tr_s, y_tr, eval_set=(X_val_s, y_val), verbose=False)
         pred_cat = model_cat.predict_proba(X_val_s)
         oof_preds['cat'][val_rows] = np.argmax(pred_cat, axis=1)
         oof_preds_4c['cat'][val_rows] = pred_cat
@@ -487,8 +488,8 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
     y_train_adjusted = y_train
 
     # Try different ensemble weight combinations
-    def eval_oof_weights(w_xgb, w_lgb, w_cat):
-        blended = oof_preds_proba['xgb'] * w_xgb + oof_preds_proba['lgb'] * w_lgb + oof_preds_proba['cat'] * w_cat
+    def eval_oof_weights(xgb, lgb, cat):
+        blended = oof_preds_proba['xgb'] * xgb + oof_preds_proba['lgb'] * lgb + oof_preds_proba['cat'] * cat
         preds = np.argmax(blended, axis=1)
         return macro_f1_with_tolerance(y_train_adjusted, preds, well_ids_train)
 
