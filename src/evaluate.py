@@ -64,6 +64,10 @@ from dl_improved import (
     build_model, train_enhanced_model, predict_enhanced_proba,
     MODEL_REGISTRY
 )
+from v3 import (
+    TwoStagePipeline, kfold_tree_ensemble, kfold_predict_proba,
+    augment_kp3, v4_predict_on_test
+)
 
 # =====================================================================
 #  1. 智能井号划分
@@ -111,9 +115,11 @@ def stratified_well_split(df, test_ratio=0.15, random_seed=42):
 #  2. 核心训练 Pipeline
 # =====================================================================
 
-def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
+def train_pipeline(train_df, hyperparams=None, dl_model_types=None,
+                  v4_mode=False):
     """
     在 train_df 上完整训练混合模型（树模型 + 多个 DL 变体）。
+    v4_mode: 额外训练 K 折树集成 + 两阶段 DL，用于生成更高精度的预测。
     返回: (模型资产 dict, 验证集得分 dict)
     """
     if hyperparams is None:
@@ -181,6 +187,7 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
 
     selector = VarianceThreshold(threshold=0.001)
     X = selector.fit_transform(X)
+    X_raw = X.copy()  # 保存缩放前的原始特征（K折用）
     feature_cols_filtered = [f for f, m in zip(feature_cols, selector.get_support()) if m]
 
     # --- 内部验证划分 ---
@@ -305,6 +312,65 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
         trained_types.append(mtype)
         print(f"    {mtype:>16s} 验证 F1: {val_scores[mtype]:.4f}")
 
+    # --- 收集验证集预测用于权重优化 ---
+    print("\n[权重优化] 收集验证集预测...")
+    val_probas = {}
+    min_f1_threshold = 0.5
+    for name in ['xgb', 'lgb', 'cat']:
+        if name in val_scores and val_scores[name] >= min_f1_threshold:
+            val_probas[name] = tree_models[name].predict_proba(X_val_scaled)
+            print(f"    收集 {name}: 验证F1={val_scores[name]:.4f}")
+    for mtype in trained_types:
+        if mtype in val_scores and val_scores[mtype] >= min_f1_threshold:
+            val_probas[mtype] = predict_enhanced_proba(dl_models[mtype], X_val_scaled, well_ids[val_mask], ws)
+            print(f"    收集 {mtype}: 验证F1={val_scores[mtype]:.4f}")
+
+    def eval_val_ensemble(weights_dict):
+        pred = np.zeros((len(X_val_scaled), 4))
+        for name, w in weights_dict.items():
+            if name in val_probas:
+                pred += val_probas[name] * w
+        return macro_f1_with_tolerance(y_val, np.argmax(pred, axis=1), well_ids_val)
+
+    best_ensemble_f1 = 0
+    best_final_weights = None
+    sorted_models = sorted(val_probas.keys(), key=lambda n: val_scores[n], reverse=True)
+    print(f"\n    [权重搜索] 候选模型: {sorted_models}")
+
+    # 策略1: 单模型
+    w1 = {sorted_models[0]: 1.0}
+    f1_1 = eval_val_ensemble(w1)
+    best_ensemble_f1 = f1_1
+    best_final_weights = w1
+    print(f"    [单模型] {sorted_models[0]}: F1={f1_1:.4f} ✓")
+
+    # 策略2: 等权重 top-k
+    for k in range(2, len(sorted_models) + 1):
+        top_k = sorted_models[:k]
+        w = {n: 1.0 / k for n in top_k}
+        f1 = eval_val_ensemble(w)
+        if f1 > best_ensemble_f1:
+            best_ensemble_f1 = f1
+            best_final_weights = w
+            print(f"    [等权重top{k}]: F1={f1:.4f} ✓ (优于 {best_ensemble_f1:.4f})")
+
+    # 策略3: score² 加权 top-k
+    for k in range(2, len(sorted_models) + 1):
+        top_k = sorted_models[:k]
+        scores = {n: val_scores[n] for n in top_k}
+        total = sum(v ** 2 for v in scores.values())
+        w = {n: (val_scores[n] ** 2) / total for n in top_k}
+        f1 = eval_val_ensemble(w)
+        if f1 > best_ensemble_f1:
+            best_ensemble_f1 = f1
+            best_final_weights = w
+            print(f"    [平方加权top{k}]: F1={f1:.4f} ✓ (优于 {best_ensemble_f1:.4f})")
+
+    final_weights = best_final_weights
+    print(f"\n    → 最优策略: 验证F1={best_ensemble_f1:.4f}")
+    for n, w in final_weights.items():
+        print(f"       {n:16s}: 权重={w:.4f}")
+
     # --- 5. 全量训练集成模型 ---
     print("\n[5] 全量训练集成模型 ...")
     X_full = scaler.fit_transform(X)
@@ -360,23 +426,39 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
     )
     cat_full.fit(X_full, y)
 
-    # 融合权重：只保留验证F1≥0.5的模型，防止低分DL模型拖后腿
-    min_f1_threshold = 0.5
-    filtered_scores = {name: score for name, score in val_scores.items() if score >= min_f1_threshold}
-    if not filtered_scores:
-        filtered_scores = val_scores  # fallback: 都用
-    removed = set(val_scores.keys()) - set(filtered_scores.keys())
-    if removed:
-        print(f"    排除低分模型(验证F1<{min_f1_threshold}): {removed}")
-
-    weights_val = {name: score ** 1.5 for name, score in filtered_scores.items()}
-
-    total_w = sum(weights_val.values())
-    final_weights = {name: w / total_w for name, w in weights_val.items()}
-
-    print("\n  模型融合权重:")
+    print("\n  最终模型融合权重:")
     for name, w in final_weights.items():
         print(f"    {name:16s}  权重: {w:.4f}  |  验证 F1: {val_scores[name]:.4f}")
+
+    # ---- v4 模式：K折树集成 + 两阶段 DL ----
+    kfold_models = None
+    kfold_weights = None
+    kfold_val_f1 = None
+    two_stage_pipeline = None
+    two_stage_val_f1 = None
+
+    if v4_mode:
+        print("\n[V4] 训练 K折树集成 ...")
+        # X_raw is unscaled but post-VarianceThreshold
+        kfold_models, oof_preds, kfold_weights, kfold_val_f1 = kfold_tree_ensemble(
+            X_raw, y, well_ids, verbose=True
+        )
+        print(f"    K折平均 ValF1={np.mean(kfold_val_f1):.4f} ± {np.std(kfold_val_f1):.4f}")
+
+        print("\n[V4] 训练两阶段 DL ...")
+        n_features = X_raw.shape[1]
+        two_stage = TwoStagePipeline(
+            n_features=n_features, window_size=hp['dl_window_size'],
+            hidden_dim=hp['dl_hidden_dim'], lr=hp['dl_lr'],
+            batch_size=hp['dl_batch_size'], dropout=hp['dl_dropout']
+        )
+        two_stage_val_f1 = two_stage.train(
+            X[train_mask], y[train_mask], well_ids[train_mask],
+            X[val_mask], y[val_mask], well_ids[val_mask],
+            epochs=hp['dl_epochs'], patience=30, verbose=True
+        )
+        two_stage_pipeline = two_stage
+        print(f"    两阶段 DL 验证 F1={two_stage_val_f1:.4f}")
 
     assets = {
         'tree_models': {'xgb': xgb_full, 'lgb': lgb_full, 'cat': cat_full},
@@ -389,6 +471,12 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
         'hyperparams': hp,
         'dl_window_size': hp['dl_window_size'],
         'dl_model_types': trained_types,
+        # v4
+        'kfold_models': kfold_models,
+        'kfold_weights': kfold_weights,
+        'kfold_val_f1': kfold_val_f1,
+        'two_stage_pipeline': two_stage_pipeline,
+        'two_stage_val_f1': two_stage_val_f1,
     }
     return assets
 
@@ -868,6 +956,8 @@ def main():
                         help='train.csv 路径 (默认: ../data/train.csv)')
     parser.add_argument('--tuned', type=str, default=None,
                         help='使用调参结果 (optuna/ray)，从 tune_results/<name>_best_params.json 加载')
+    parser.add_argument('--v4', action='store_true',
+                        help='v4 模式：K折树集成 + 两阶段DL + DP v2')
     args = parser.parse_args()
 
     t_start = time.time()
@@ -929,7 +1019,8 @@ def main():
 
     dl_types = ['hybrid_v3', 'lstm_only', 'transformer_only']
 
-    assets = train_pipeline(train_df, hyperparams, dl_model_types=dl_types)
+    assets = train_pipeline(train_df, hyperparams, dl_model_types=dl_types,
+                            v4_mode=args.v4)
 
     # ---- 测试集特征工程 ----
     print("\n[6] 测试集特征工程 ...")
@@ -1028,6 +1119,27 @@ def main():
         'pred': pred_full, 'pred_dp': pred_full_dp,
     }
 
+    # ============ V4 模式评分（如果启用） ============
+    v4_tol_f1 = None
+    v4_pred = None
+    if args.v4:
+        print(f"\n{'─'*75}")
+        print(f"  📊 V4 增强模型 (K折 + 两阶段DL + DP v2)")
+        print(f"{'─'*75}")
+        v4_pred = v4_predict_on_test(
+            assets, test_features,
+            two_stage_pipeline=assets.get('two_stage_pipeline')
+        )
+        v4_tol_f1 = macro_f1_with_tolerance(y_true, v4_pred, well_ids_test)
+        v4_std_f1 = f1_score(y_true, v4_pred, average='macro', zero_division=0)
+        v4_w_f1   = f1_score(y_true, v4_pred, average='weighted', zero_division=0)
+        print(f"  {'V4-带DP':>32}  {v4_tol_f1:>13.4f}   {v4_std_f1:>13.4f}   {v4_w_f1:>13.4f}")
+        if assets.get('kfold_val_f1'):
+            mean_cv = np.mean(assets['kfold_val_f1'])
+            print(f"  {'K-fold CV平均F1':>32}  {mean_cv:>13.4f}")
+        if assets.get('two_stage_val_f1'):
+            print(f"  {'两阶段DL验证F1':>32}  {assets['two_stage_val_f1']:>13.4f}")
+
     # ============ 对比汇总 ============
     print(f"\n{'='*75}")
     print(f"  ⇨ 对比汇总")
@@ -1039,6 +1151,10 @@ def main():
     print(f"  {'混合ML模型(ML-only)':>32}  {ml_tol_f1:>13.4f}")
     print(f"  {'混合深度(V3)':>32}  {dl_tol:>13.4f}")
     print(f"  {'最终大混合模型(全模型)':>32}  {full_tol_f1:>13.4f}")
+    if v4_tol_f1 is not None:
+        print(f"  {'V4 (K折+两阶段+DPv2)':>32}  {v4_tol_f1:>13.4f}")
+        print(f"  {'V4 vs 大混合 差异':>32}  {v4_tol_f1 - full_dp_tol:>+13.4f}")
+        print(f"  {'V4 vs 混合ML-DP 差异':>32}  {v4_tol_f1 - ml_dp_tol:>+13.4f}")
     print(f"  {'大混合 vs 混合ML 差异':>32}  {full_tol_f1 - ml_tol_f1:>+13.4f}")
     print(f"  {'大混合 vs 混合深度 差异':>32}  {full_tol_f1 - dl_tol:>+13.4f}")
     print(f"  {'混合深度 vs 混合ML 差异':>32}  {dl_tol - ml_tol_f1:>+13.4f}")
@@ -1088,8 +1204,10 @@ def main():
         'dl_hybrid': {'tol_f1': dl_tol, 'std_f1': dl_std, 'w_f1': dl_w},
         'full_hybrid': {'tol_f1': full_tol_f1, 'std_f1': full_std_f1, 'w_f1': full_w_f1,
                         'dp_tol_f1': full_dp_tol},
+        'v4': {'tol_f1': v4_tol_f1} if v4_tol_f1 is not None else None,
         'val_scores': assets['val_scores'],
         'final_weights': assets['final_weights'],
+        'kfold_weights': assets.get('kfold_weights'),
         'test_wells': list(test_wells),
         'test_rows': len(test_features),
     }
@@ -1106,6 +1224,8 @@ def main():
         '真实关键点': y_true,
         '大混合预测': pred_full_dp,
     })
+    if v4_pred is not None:
+        submission['V4预测'] = v4_pred
     sub_path = os.path.join(args.output, 'predictions.csv')
     submission.to_csv(sub_path, index=False, encoding='utf-8-sig')
     print(f"  预测结果已保存: {sub_path}")

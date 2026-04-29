@@ -300,9 +300,14 @@ def train_enhanced_model(X_train, y_train, well_ids_train,
                         num_classes=n_classes, dropout=dropout).to(device)
 
     if class_weights is None:
-        cw = torch.FloatTensor([1.0, 100.0, 100.0, 100.0]).to(device)
+        cw = torch.FloatTensor([1.0, 10.0, 15.0, 30.0]).to(device)
     else:
-        cw = torch.FloatTensor(class_weights).to(device)
+        cw_arr = np.asarray(class_weights, dtype=np.float32)
+        # Normalize to prevent extreme gradients: cap max/min ratio at 30
+        ratio = cw_arr.max() / max(cw_arr.min(), 1e-8)
+        if ratio > 30:
+            cw_arr = cw_arr / (ratio / 30)
+        cw = torch.FloatTensor(cw_arr).to(device)
     criterion = FocalLoss(alpha=cw, gamma=2.0)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr,

@@ -728,6 +728,187 @@ def advanced_post_process(test_features, tree_preds, dl_preds, weights):
     return final_predictions
 
 
+# ==================== 6b. 增强版动态规划后处理 v2 ==========
+
+def dp_post_process_v2(well_data, model_proba, prior_info=None,
+                       detection_scores=None,
+                       candidates_per_class=50, dp_search_width=30,
+                       min_spacing=10, kp3_min_spacing=5,
+                       phys_weight=0.15, prior_weight=0.15,
+                       detection_weight=0.2):
+    """
+    增强版 DP v2 后处理
+
+    Improvements over v1:
+    - Wider candidate search: top-50 candidates, top-30 in DP search
+    - Relaxed KP3-KP2 spacing: min 5 instead of 10
+    - Better physical scoring using local curvature (JX_diff_2)
+    - Well-depth prior: KP1 in first 50%, KP3 in last 30-95%
+    - Detection scores as additional signal (from Stage 1 detector)
+    - Allow KP3 absence with penalty
+    """
+    n = len(well_data)
+    jx = well_data['JX'].values
+    jx_diff = np.diff(jx, prepend=jx[0])
+    jx_diff2 = np.diff(jx, n=2, prepend=jx[0], append=jx[-1])  # curvature
+    well_len = n
+
+    candidates = {1: [], 2: [], 3: []}
+
+    for kp in [1, 2, 3]:
+        kp_proba = model_proba[:, kp]
+        top_k_indices = np.argsort(kp_proba)[-candidates_per_class:]
+
+        for idx in top_k_indices:
+            if kp_proba[idx] > 0.05:
+                score = kp_proba[idx]
+
+                # --- Physical scoring (improved) ---
+                phys_score = 0
+                if kp == 1:
+                    # KP1: inclination should increase after this point
+                    if idx < n - 10:
+                        future_trend = jx[idx+1:idx+11].mean() - jx[idx]
+                        if future_trend > 0:
+                            phys_score = 0.3 * min(future_trend / 1.0, 1.0)
+                    # Well-depth prior: KP1 should be in first 50% of well
+                    depth_frac = idx / max(well_len, 1)
+                    if depth_frac < 0.5:
+                        phys_score += 0.1 * (1 - depth_frac / 0.5)
+
+                elif kp == 2:
+                    # KP2: low JX variation in a wide window
+                    half_w = min(15, idx, n - 1 - idx)
+                    if half_w >= 5:
+                        local_std = jx_diff[idx-half_w:idx+half_w+1].std()
+                        phys_score = 0.3 * max(0, 1 - local_std / 0.3)
+                    # KP2 should be after KP1 (in the middle portion)
+                    depth_frac = idx / max(well_len, 1)
+                    if 0.2 <= depth_frac <= 0.8:
+                        phys_score += 0.05
+
+                elif kp == 3:
+                    # KP3: decreasing trend
+                    if idx < n - 10:
+                        future_trend = jx[idx+1:idx+11].mean() - jx[idx]
+                        if future_trend < 0:
+                            phys_score = 0.3 * min(-future_trend / 0.6, 1.0)
+                    # Also check curvature (should be S-shaped → negative 2nd deriv)
+                    if idx >= 2 and idx < n - 2:
+                        local_curve = jx_diff2[idx-2:idx+3].mean()
+                        if local_curve < 0:
+                            phys_score += 0.1 * min(-local_curve / 0.1, 1.0)
+                    # Well-depth prior: KP3 should be in last 30-95% of well
+                    depth_frac = idx / max(well_len, 1)
+                    if 0.3 <= depth_frac <= 0.95:
+                        phys_score += 0.1
+
+                # --- Prior score ---
+                prior_score = 0
+                if prior_info and kp in prior_info:
+                    dist = abs(idx - prior_info[kp])
+                    if dist < 15:
+                        prior_score = prior_weight * (1 - dist / 15)
+
+                # --- Detection score (from Stage 1 detector, binary) ---
+                det_score = 0
+                if detection_scores is not None:
+                    det_score = detection_scores[idx] * detection_weight
+
+                total_score = score + phys_score + prior_score + det_score
+                candidates[kp].append((idx, total_score))
+
+        candidates[kp].sort(key=lambda x: x[1], reverse=True)
+
+    # --- DP search for best combo ---
+    best_combo = None
+    best_score = -1
+    best_kp3_missing_penalty = 0.0  # penalty for no KP3
+
+    for kp1_idx, kp1_score in candidates[1][:dp_search_width]:
+        for kp2_idx, kp2_score in candidates[2][:dp_search_width]:
+            if kp2_idx < kp1_idx + min_spacing:
+                continue
+
+            # KP2-KP1 spacing bonus
+            spacing_bonus1 = 0.1 if 15 <= kp2_idx - kp1_idx <= 50 else 0
+
+            kp3_candidates = candidates[3][:dp_search_width] + [(None, 0)]
+            for kp3_idx, kp3_score in kp3_candidates:
+                if kp3_idx is not None:
+                    if kp3_idx < kp2_idx + kp3_min_spacing:
+                        continue
+                    spacing_bonus2 = 0.1 if 10 <= kp3_idx - kp2_idx <= 60 else 0
+                    combo_score = (kp1_score + spacing_bonus1 +
+                                   kp2_score + spacing_bonus2 +
+                                   kp3_score)
+                    if combo_score > best_score:
+                        best_score = combo_score
+                        best_combo = {1: kp1_idx, 2: kp2_idx, 3: kp3_idx}
+                else:
+                    # No KP3: small penalty to prefer having KP3 when plausible
+                    combo_score = kp1_score + spacing_bonus1 + kp2_score - 0.2
+                    if combo_score > best_score:
+                        best_score = combo_score
+                        best_combo = {1: kp1_idx, 2: kp2_idx}
+
+    if best_combo is None:
+        best_combo = {}
+        for kp in [1, 2, 3]:
+            if candidates[kp]:
+                best_combo[kp] = candidates[kp][0][0]
+
+    return best_combo
+
+
+def advanced_post_process_v2(test_features, tree_preds, dl_preds, weights,
+                              detection_scores=None):
+    """
+    增强版后处理 v2 — 使用 dp_post_process_v2
+    """
+    print("\n[9/9] 增强后处理 v2 ...")
+
+    final_proba = np.zeros((len(test_features), 4))
+    for name, proba in tree_preds.items():
+        final_proba += proba * weights.get(name, 0)
+    for name, proba in dl_preds.items():
+        final_proba += proba * weights.get(name, 0)
+
+    final_predictions = np.zeros(len(test_features), dtype=int)
+
+    for well_id in tqdm(test_features['well_id'].unique(), desc="  逐井后处理v2"):
+        mask = test_features['well_id'] == well_id
+        group = test_features[mask].reset_index(drop=True)
+        group_indices = np.where(mask)[0]
+        group_proba = final_proba[group_indices]
+
+        # Extract prior info
+        prior_keypoints = {}
+        for kp in [1, 2, 3]:
+            col_name = f'dist_to_prior_kp{kp}'
+            if col_name in group.columns:
+                dists = group[col_name].values
+                if dists.min() < 900:
+                    prior_keypoints[kp] = int(dists.argmin())
+
+        # Detection scores for this well
+        group_det = None
+        if detection_scores is not None:
+            group_det = detection_scores[group_indices]
+
+        best_combo = dp_post_process_v2(
+            group, group_proba, prior_keypoints,
+            detection_scores=group_det
+        )
+
+        for kp, idx in best_combo.items():
+            if 0 <= idx < len(group):
+                global_idx = group_indices[idx]
+                final_predictions[global_idx] = kp
+
+    return final_predictions
+
+
 # ==================== 数据库交互模块 ====================
 
 def load_data_from_db(engine):
