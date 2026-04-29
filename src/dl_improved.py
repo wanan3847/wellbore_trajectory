@@ -66,12 +66,27 @@ class DrillingWindowDataset(Dataset):
         pad_before = max(0, half - before)
         pad_after  = max(0, half - after)
 
+        # 使用反射填充(较重复填充减少边沿伪影)
         if pad_before > 0:
-            prefix = self.X[lo:lo+1].repeat(pad_before, axis=0)
-            window = np.concatenate([prefix, window], axis=0)
+            reflect_len = min(pad_before, hi - lo)
+            if reflect_len > 0:
+                reflect = self.X[lo:lo+reflect_len][::-1]
+                if reflect.shape[0] < pad_before:
+                    reflect = np.concatenate([reflect] * (pad_before // reflect.shape[0] + 1), axis=0)
+                window = np.concatenate([reflect[:pad_before], window], axis=0)
+            else:
+                prefix = self.X[lo:lo+1].repeat(pad_before, axis=0)
+                window = np.concatenate([prefix, window], axis=0)
         if pad_after > 0:
-            suffix = self.X[hi-1:hi].repeat(pad_after, axis=0)
-            window = np.concatenate([window, suffix], axis=0)
+            reflect_len = min(pad_after, hi - lo)
+            if reflect_len > 0:
+                reflect = self.X[hi-reflect_len:hi][::-1]
+                if reflect.shape[0] < pad_after:
+                    reflect = np.concatenate([reflect] * (pad_after // reflect.shape[0] + 1), axis=0)
+                window = np.concatenate([window, reflect[:pad_after]], axis=0)
+            else:
+                suffix = self.X[hi-1:hi].repeat(pad_after, axis=0)
+                window = np.concatenate([window, suffix], axis=0)
 
         x = torch.FloatTensor(window).permute(1, 0)
 
@@ -273,7 +288,8 @@ def train_enhanced_model(X_train, y_train, well_ids_train,
                           n_features=None, window_size=51,
                           hidden_dim=128, lr=0.001, batch_size=256,
                           epochs=150, dropout=0.3, weight_decay=1e-4,
-                          patience=30, verbose=True):
+                          patience=30, verbose=True,
+                          class_weights=None):
     """训练增强版深度学习模型（CE Loss + ReduceLROnPlateau）"""
     device = Config.DEVICE
     if n_features is None:
@@ -283,7 +299,10 @@ def train_enhanced_model(X_train, y_train, well_ids_train,
     model = build_model(model_type, n_features, window_size, hidden_dim,
                         num_classes=n_classes, dropout=dropout).to(device)
 
-    cw = torch.FloatTensor([1.0, 100.0, 100.0, 100.0]).to(device)
+    if class_weights is None:
+        cw = torch.FloatTensor([1.0, 100.0, 100.0, 100.0]).to(device)
+    else:
+        cw = torch.FloatTensor(class_weights).to(device)
     criterion = FocalLoss(alpha=cw, gamma=2.0)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr,

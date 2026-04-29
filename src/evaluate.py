@@ -121,28 +121,35 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
     if dl_model_types is None:
         dl_model_types = ['hybrid_v3', 'lstm_only', 'transformer_only']
 
+    # 关键修复：NaN标签必须填充为0，否则被当成关键点导致训练数据污染
+    if '关键点' in train_df.columns:
+        n_nan = train_df['关键点'].isna().sum()
+        if n_nan > 0:
+            train_df['关键点'] = train_df['关键点'].fillna(0).astype(int)
+            print(f"  [修复] 填充了 {n_nan} 个 NaN 标签为 0")
+
     hp = {**{
-        'hard_neg_window': Config.HARD_NEGATIVE_WINDOW,
-        'neg_sample_ratio': Config.NEGATIVE_SAMPLE_RATIO,
+        'hard_neg_window': 50,
+        'neg_sample_ratio': 0.638,
         'tree_n_estimators': 1000,
-        'tree_max_depth': 16,
-        'tree_learning_rate': 0.05,
-        'xgb_subsample': 1.0,
-        'xgb_colsample_bytree': 1.0,
-        'xgb_min_child_weight': 1,
-        'xgb_gamma': 0,
-        'xgb_reg_lambda': 1.0,
-        'xgb_reg_alpha': 0,
-        'lgb_num_leaves': 64,
-        'lgb_subsample': 1.0,
-        'lgb_colsample_bytree': 1.0,
-        'lgb_min_child_samples': 20,
-        'lgb_reg_lambda': 0.0,
-        'lgb_reg_alpha': 0.0,
-        'cat_depth': 12,
-        'cat_l2_leaf_reg': 3.0,
-        'cat_subsample': 1.0,
-        'cat_border_count': 128,
+        'tree_max_depth': 19,
+        'tree_learning_rate': 0.087,
+        'xgb_subsample': 0.789,
+        'xgb_colsample_bytree': 0.648,
+        'xgb_min_child_weight': 8,
+        'xgb_gamma': 3.8,
+        'xgb_reg_lambda': 1.33,
+        'xgb_reg_alpha': 3.86,
+        'lgb_num_leaves': 44,
+        'lgb_subsample': 0.809,
+        'lgb_colsample_bytree': 0.771,
+        'lgb_min_child_samples': 12,
+        'lgb_reg_lambda': 1.08,
+        'lgb_reg_alpha': 0.314,
+        'cat_depth': 11,
+        'cat_l2_leaf_reg': 2.06,
+        'cat_subsample': 0.803,
+        'cat_border_count': 235,
         'dl_hidden_dim': 128,
         'dl_lr': 0.001,
         'dl_batch_size': 256,
@@ -150,7 +157,7 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
         'dl_weight_decay': 1e-5,
         'dl_epochs': 150,
         'dl_window_size': 51,
-        'class_weight_cls_positive': 50,
+        'class_weight_cls_positive': 128,
     }, **hyperparams}
 
     # --- 特征工程 ---
@@ -190,7 +197,7 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
     y_train, y_val = y[train_mask], y[val_mask]
     well_ids_val   = well_ids[val_mask]
 
-    cw_dict = {0: 1, 1: hp['class_weight_cls_positive'], 2: hp['class_weight_cls_positive'], 3: hp['class_weight_cls_positive']}
+    cw_dict = {0: 1, 1: hp['class_weight_cls_positive'], 2: int(hp['class_weight_cls_positive'] * 1.5), 3: int(hp['class_weight_cls_positive'] * 4)}
     sample_weights_train = np.array([cw_dict[int(l)] for l in y_train])
 
     tree_models = {}
@@ -275,6 +282,7 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
     # --- 4. 训练深度学习 V3 系列模型 ---
     input_dim = X_train_scaled.shape[1]
     ws = hp['dl_window_size']
+    dl_cw = [1.0, float(cw_dict[1]), float(cw_dict[2]), float(cw_dict[3])]
 
     dl_models = {}
     trained_types = []
@@ -288,6 +296,7 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
             lr=hp['dl_lr'], batch_size=hp['dl_batch_size'],
             epochs=hp['dl_epochs'], dropout=hp['dl_dropout'],
             weight_decay=hp['dl_weight_decay'],
+            class_weights=dl_cw,
         )
         dl_val_proba = predict_enhanced_proba(dl_model, X_val_scaled, well_ids[val_mask], ws)
         dl_val_pred = np.argmax(dl_val_proba, axis=1)
@@ -351,8 +360,16 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None):
     )
     cat_full.fit(X_full, y)
 
-    # 融合权重（用 Score^1.5 加权，降低对验证集排名的过度依赖）
-    weights_val = {name: score ** 1.5 for name, score in val_scores.items()}
+    # 融合权重：只保留验证F1≥0.5的模型，防止低分DL模型拖后腿
+    min_f1_threshold = 0.5
+    filtered_scores = {name: score for name, score in val_scores.items() if score >= min_f1_threshold}
+    if not filtered_scores:
+        filtered_scores = val_scores  # fallback: 都用
+    removed = set(val_scores.keys()) - set(filtered_scores.keys())
+    if removed:
+        print(f"    排除低分模型(验证F1<{min_f1_threshold}): {removed}")
+
+    weights_val = {name: score ** 1.5 for name, score in filtered_scores.items()}
 
     total_w = sum(weights_val.values())
     final_weights = {name: w / total_w for name, w in weights_val.items()}
@@ -885,7 +902,7 @@ def main():
     hyperparams = {}
     if args.quick:
         hyperparams.update({
-            'tree_n_estimators': 300,
+            'tree_n_estimators': 500,
             'dl_epochs': 100,
         })
         print(f"\n⚡ 快速模式: tree_n_estimators={hyperparams['tree_n_estimators']}, "

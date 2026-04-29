@@ -51,7 +51,7 @@ class Config:
 
     # 负样本采样
     HARD_NEGATIVE_WINDOW = 150  # 关键点前后150个点作为困难负样本
-    NEGATIVE_SAMPLE_RATIO = 0.8  # 保留30%的负样本
+    NEGATIVE_SAMPLE_RATIO = 0.8  # 保留80%的简单负样本（配合hard_neg_window保留全部困难负样本）
 
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')#有显卡则用显卡加速
 
@@ -470,7 +470,10 @@ def create_advanced_features_v2(df, is_train=True):
         f_dict['jx_percentile'] = jx_series.rank(pct=True).values
 
         if is_train and '关键点' in group.columns:
-            f_dict['label'] = group['关键点'].values
+            label_vals = group['关键点'].values
+            # 保护：NaN标签填充为0
+            label_vals = np.nan_to_num(label_vals, nan=0.0).astype(int)
+            f_dict['label'] = label_vals
 
         # 将当前井的字典一次性转为 DataFrame
         all_well_frames.append(pd.DataFrame(f_dict))
@@ -492,6 +495,11 @@ def sample_hard_negatives(df, window=50, ratio=0.3):
     采样困难负样本：保留关键点附近的负样本 + 随机采样部分远离关键点的负样本
     """
     print("\n[3/9] 困难负样本采样...")
+
+    # 修复：NaN标签必须填充为0
+    if 'label' in df.columns and df['label'].isna().any():
+        df = df.copy()
+        df['label'] = df['label'].fillna(0).astype(int)
 
     sampled_list = []
 

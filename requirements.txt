@@ -13,7 +13,8 @@ catboost
 fastdtw
 tqdm
 scipy 
-
+optuna
+ray[tune]
 
 
 📊 评测方法（官方原文整理）                                                                                        
