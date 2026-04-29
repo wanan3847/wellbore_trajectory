@@ -105,7 +105,7 @@ class Stage1Detector(nn.Module):
             nn.LayerNorm(64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 1)  # 二分类：logit → sigmoid
+            nn.Linear(64, 2)  # 二分类：2-class logits
         )
 
     def forward(self, x):
@@ -120,8 +120,7 @@ class Stage1Detector(nn.Module):
         weights = F.softmax(scores, dim=-1)
         pooled = torch.matmul(weights, lstm_out).squeeze(1)
 
-        logit = self.fc(pooled)
-        return logit.squeeze(-1)
+        return self.fc(pooled)  # [batch, 2]
 
 
 class Stage2Classifier(nn.Module):
@@ -244,7 +243,7 @@ class TwoStagePipeline:
                 bx, by = bx.to(DEVICE), by.to(DEVICE)
                 det_optim.zero_grad()
                 logits = self.detector(bx)
-                loss = det_criterion(logits.view(-1, 2), by)
+                loss = det_criterion(logits, by)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.detector.parameters(), 5.0)
                 det_optim.step()
@@ -255,7 +254,7 @@ class TwoStagePipeline:
             with torch.no_grad():
                 for bx, _ in val_ld:
                     logits = self.detector(bx.to(DEVICE))
-                    preds.extend(torch.argmax(logits.view(-1, 2), dim=1).cpu().numpy())
+                    preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
 
             f1 = f1_score(sorted_y_bin_val, np.array(preds), average='binary', zero_division=0)
             det_sched.step(f1)
