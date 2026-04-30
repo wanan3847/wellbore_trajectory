@@ -17,7 +17,7 @@ import xgboost as xgb
 import lightgbm as lgb
 import catboost as cb
 from tqdm import tqdm
-import sys, os, copy, warnings
+import sys, os, copy, gc, warnings
 warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -387,7 +387,7 @@ class TwoStagePipeline:
 
 def kfold_tree_ensemble(X_train, y_train, well_ids_train,
                         tree_params=None, n_folds=5, random_seed=42,
-                        verbose=True):
+                        tree_n_estimators=300, verbose=True):
     """
     按井分层的 K 折交叉验证训练树模型。
     Returns:
@@ -424,31 +424,32 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
     val_f1_list = []
 
     default_xgb = {
-        'n_estimators': 400, 'max_depth': 10, 'learning_rate': 0.05,
+        'n_estimators': tree_n_estimators, 'max_depth': 10, 'learning_rate': 0.05,
         'subsample': 0.8, 'colsample_bytree': 0.8,
         'min_child_weight': 5, 'gamma': 2.0,
         'reg_lambda': 2.0, 'reg_alpha': 2.0,
         'eval_metric': 'mlogloss', 'use_label_encoder': False,
-        'random_state': random_seed, 'verbosity': 0, 'n_jobs': -1,
+        'random_state': random_seed, 'verbosity': 0, 'n_jobs': 1,
         'early_stopping_rounds': 20,
     }
     default_xgb.update(tree_params.get('xgb', {}))
 
     default_lgb = {
-        'n_estimators': 400, 'num_leaves': 31, 'learning_rate': 0.05,
+        'n_estimators': tree_n_estimators, 'num_leaves': 31, 'learning_rate': 0.05,
         'subsample': 0.8, 'colsample_bytree': 0.8,
         'min_child_samples': 20,
         'reg_lambda': 2.0, 'reg_alpha': 1.0,
         'class_weight': {0: 1, 1: 40, 2: 60, 3: 100},
-        'random_state': random_seed, 'verbose': -1, 'n_jobs': -1,
+        'random_state': random_seed, 'verbose': -1, 'n_jobs': 1,
     }
     default_lgb.update(tree_params.get('lgb', {}))
 
     default_cat = {
-        'n_estimators': 400, 'depth': 8, 'learning_rate': 0.05,
+        'n_estimators': tree_n_estimators, 'depth': 8, 'learning_rate': 0.05,
         'l2_leaf_reg': 3.0,
         'class_weights': {0: 1, 1: 40, 2: 60, 3: 100},
         'random_seed': random_seed, 'verbose': False,
+        'early_stopping_rounds': 20,
     }
     default_cat.update(tree_params.get('cat', {}))
 
@@ -476,14 +477,20 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
         oof_preds['xgb'][val_rows] = np.argmax(pred_xgb, axis=1)
         oof_preds_4c['xgb'][val_rows] = pred_xgb
         cv_models['xgb'].append(model_xgb)
+        # 释放内存
+        del pred_xgb
+        gc.collect()
 
         # LightGBM
         model_lgb = lgb.LGBMClassifier(**default_lgb)
-        model_lgb.fit(X_tr_s, y_tr, eval_set=[(X_val_s, y_val)], callbacks=[lgb.early_stopping(20)])
+        model_lgb.fit(X_tr_s, y_tr, eval_set=[(X_val_s, y_val)],
+                       callbacks=[lgb.early_stopping(20)])
         pred_lgb = model_lgb.predict_proba(X_val_s)
         oof_preds['lgb'][val_rows] = np.argmax(pred_lgb, axis=1)
         oof_preds_4c['lgb'][val_rows] = pred_lgb
         cv_models['lgb'].append(model_lgb)
+        del pred_lgb
+        gc.collect()
 
         # CatBoost
         model_cat = cb.CatBoostClassifier(**default_cat)
@@ -492,6 +499,8 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
         oof_preds['cat'][val_rows] = np.argmax(pred_cat, axis=1)
         oof_preds_4c['cat'][val_rows] = pred_cat
         cv_models['cat'].append(model_cat)
+        del pred_cat
+        gc.collect()
 
         # Evaluate fold
         fold_ensemble = (pred_xgb + pred_lgb + pred_cat) / 3
@@ -607,7 +616,7 @@ def v4_predict_on_test(assets, test_features, two_stage_pipeline=None,
                 tree_preds[name] = proba
         dp_weights = assets.get('final_weights', {})
 
-    # 两阶段 DL 检测门控
+    # 两阶段 DL 检测门控（仅检测分数用于 DP 辅助信号，不参入 ensemble 投票）
     detection_scores = None
     if two_stage_pipeline is not None:
         test_feat_array = test_features[assets['feature_cols']].values
@@ -615,11 +624,7 @@ def v4_predict_on_test(assets, test_features, two_stage_pipeline=None,
             test_feat_array, test_features['well_id'].values
         )
         detection_scores = det_scores
-        # 将 DL 门控后的概率加入 ensemble
-        dl_preds['two_stage'] = gated_cls
-        # DL 验证 F1 用于确定权重
-        dl_val_f1 = max(assets.get('two_stage_val_f1', 0.1), 0.1)
-        dp_weights['two_stage'] = dl_val_f1
+        # 不将 DL 预测加入 dp_weights（val F1 太低会拖累 ensemble）
 
     # 使用 DP v2 后处理（含 detection_scores 辅助信号 + 最佳 DP 参数）
     dp_kwargs = best_dp_params or {}

@@ -465,8 +465,9 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None,
     two_stage_val_f1 = None
 
     print("\n[4] 训练 K折树集成 ...")
+    kfold_n_est = min(hp['tree_n_estimators'], 400)
     kfold_models, oof_preds, kfold_weights, kfold_val_f1, kfold_scaler = kfold_tree_ensemble(
-        X_raw, y, well_ids, verbose=True
+        X_raw, y, well_ids, verbose=True, tree_n_estimators=kfold_n_est
     )
     print(f"    K折平均 ValF1={np.mean(kfold_val_f1):.4f} ± {np.std(kfold_val_f1):.4f}")
 
