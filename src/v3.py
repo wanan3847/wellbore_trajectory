@@ -449,7 +449,6 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
         'l2_leaf_reg': 3.0,
         'class_weights': {0: 1, 1: 40, 2: 60, 3: 100},
         'random_seed': random_seed, 'verbose': False,
-        'early_stopping_rounds': 20,
     }
     default_cat.update(tree_params.get('cat', {}))
 
@@ -495,12 +494,8 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
         oof_preds_4c['cat'][val_rows] = pred_cat
         cv_models['cat'].append(model_cat)
 
-        # Evaluate fold (before releasing pred memory)
+        # Evaluate fold
         fold_ensemble = (pred_xgb + pred_lgb + pred_cat) / 3
-
-        # 释放每折内存
-        del pred_xgb, pred_lgb, pred_cat, model_xgb, model_lgb, model_cat
-        gc.collect()
         fold_pred = np.argmax(fold_ensemble, axis=1)
         fold_f1 = macro_f1_with_tolerance(y_val, fold_pred, wid_val)
         val_f1_list.append(fold_f1)
