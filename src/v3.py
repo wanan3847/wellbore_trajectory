@@ -428,7 +428,7 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
         'subsample': 0.8, 'colsample_bytree': 0.8,
         'min_child_weight': 5, 'gamma': 2.0,
         'reg_lambda': 2.0, 'reg_alpha': 2.0,
-        'eval_metric': 'mlogloss', 'use_label_encoder': False,
+        'eval_metric': 'mlogloss',
         'random_state': random_seed, 'verbosity': 0, 'n_jobs': 1,
         'early_stopping_rounds': 20,
     }
@@ -472,30 +472,32 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
         # XGBoost
         model_xgb = xgb.XGBClassifier(**default_xgb)
         model_xgb.fit(X_tr_s, y_tr, eval_set=[(X_val_s, y_val)])
-        pred_xgb = model_xgb.predict_proba(X_val_s)
-        oof_preds['xgb'][val_rows] = np.argmax(pred_xgb, axis=1)
-        oof_preds_4c['xgb'][val_rows] = pred_xgb
+        oof_preds['xgb'][val_rows] = model_xgb.predict(X_val_s)
+        oof_preds_4c['xgb'][val_rows] = model_xgb.predict_proba(X_val_s)
         cv_models['xgb'].append(model_xgb)
 
         # LightGBM
         model_lgb = lgb.LGBMClassifier(**default_lgb)
         model_lgb.fit(X_tr_s, y_tr, eval_set=[(X_val_s, y_val)],
                        callbacks=[lgb.early_stopping(20)])
-        pred_lgb = model_lgb.predict_proba(X_val_s)
-        oof_preds['lgb'][val_rows] = np.argmax(pred_lgb, axis=1)
-        oof_preds_4c['lgb'][val_rows] = pred_lgb
+        oof_preds['lgb'][val_rows] = model_lgb.predict(X_val_s)
+        oof_preds_4c['lgb'][val_rows] = model_lgb.predict_proba(X_val_s)
         cv_models['lgb'].append(model_lgb)
 
         # CatBoost
         model_cat = cb.CatBoostClassifier(**default_cat)
         model_cat.fit(X_tr_s, y_tr, eval_set=(X_val_s, y_val), verbose=False)
-        pred_cat = model_cat.predict_proba(X_val_s)
-        oof_preds['cat'][val_rows] = np.argmax(pred_cat, axis=1)
-        oof_preds_4c['cat'][val_rows] = pred_cat
+        oof_preds['cat'][val_rows] = model_cat.predict(X_val_s).flatten()
+        oof_preds_4c['cat'][val_rows] = model_cat.predict_proba(X_val_s)
         cv_models['cat'].append(model_cat)
 
         # Evaluate fold
-        fold_ensemble = (pred_xgb + pred_lgb + pred_cat) / 3
+        fold_probas = np.stack([
+            oof_preds_4c['xgb'][val_rows],
+            oof_preds_4c['lgb'][val_rows],
+            oof_preds_4c['cat'][val_rows],
+        ], axis=0)
+        fold_ensemble = fold_probas.mean(axis=0)
         fold_pred = np.argmax(fold_ensemble, axis=1)
         fold_f1 = macro_f1_with_tolerance(y_val, fold_pred, wid_val)
         val_f1_list.append(fold_f1)
