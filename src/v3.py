@@ -477,9 +477,6 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
         oof_preds['xgb'][val_rows] = np.argmax(pred_xgb, axis=1)
         oof_preds_4c['xgb'][val_rows] = pred_xgb
         cv_models['xgb'].append(model_xgb)
-        # 释放内存
-        del pred_xgb
-        gc.collect()
 
         # LightGBM
         model_lgb = lgb.LGBMClassifier(**default_lgb)
@@ -489,8 +486,6 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
         oof_preds['lgb'][val_rows] = np.argmax(pred_lgb, axis=1)
         oof_preds_4c['lgb'][val_rows] = pred_lgb
         cv_models['lgb'].append(model_lgb)
-        del pred_lgb
-        gc.collect()
 
         # CatBoost
         model_cat = cb.CatBoostClassifier(**default_cat)
@@ -499,11 +494,13 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
         oof_preds['cat'][val_rows] = np.argmax(pred_cat, axis=1)
         oof_preds_4c['cat'][val_rows] = pred_cat
         cv_models['cat'].append(model_cat)
-        del pred_cat
-        gc.collect()
 
-        # Evaluate fold
+        # Evaluate fold (before releasing pred memory)
         fold_ensemble = (pred_xgb + pred_lgb + pred_cat) / 3
+
+        # 释放每折内存
+        del pred_xgb, pred_lgb, pred_cat, model_xgb, model_lgb, model_cat
+        gc.collect()
         fold_pred = np.argmax(fold_ensemble, axis=1)
         fold_f1 = macro_f1_with_tolerance(y_val, fold_pred, wid_val)
         val_f1_list.append(fold_f1)
