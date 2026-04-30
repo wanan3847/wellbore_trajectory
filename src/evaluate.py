@@ -137,23 +137,23 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None,
     hp = {**{
         'hard_neg_window': 50,
         'neg_sample_ratio': 0.638,
-        'tree_n_estimators': 1000,
-        'tree_max_depth': 19,
-        'tree_learning_rate': 0.087,
+        'tree_n_estimators': 600,
+        'tree_max_depth': 12,
+        'tree_learning_rate': 0.05,
         'xgb_subsample': 0.789,
         'xgb_colsample_bytree': 0.648,
         'xgb_min_child_weight': 8,
         'xgb_gamma': 3.8,
         'xgb_reg_lambda': 1.33,
         'xgb_reg_alpha': 3.86,
-        'lgb_num_leaves': 44,
+        'lgb_num_leaves': 31,
         'lgb_subsample': 0.809,
         'lgb_colsample_bytree': 0.771,
-        'lgb_min_child_samples': 12,
+        'lgb_min_child_samples': 15,
         'lgb_reg_lambda': 1.08,
         'lgb_reg_alpha': 0.314,
-        'cat_depth': 11,
-        'cat_l2_leaf_reg': 2.06,
+        'cat_depth': 8,
+        'cat_l2_leaf_reg': 3.0,
         'cat_subsample': 0.803,
         'cat_border_count': 235,
         'dl_hidden_dim': 128,
@@ -163,7 +163,7 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None,
         'dl_weight_decay': 1e-5,
         'dl_epochs': 150,
         'dl_window_size': 51,
-        'class_weight_cls_positive': 128,
+        'class_weight_cls_positive': 50,
     }, **hyperparams}
 
     # --- 特征工程 ---
@@ -430,21 +430,22 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None,
     for name, w in final_weights.items():
         print(f"    {name:16s}  权重: {w:.4f}  |  验证 F1: {val_scores[name]:.4f}")
 
-    # ---- v4 模式：K折树集成 + 两阶段 DL ----
+    # ---- K折树集成 (始终训练, 作为主模型) ----
     kfold_models = None
     kfold_weights = None
     kfold_val_f1 = None
+    kfold_scaler = None
     two_stage_pipeline = None
     two_stage_val_f1 = None
 
-    if v4_mode:
-        print("\n[V4] 训练 K折树集成 ...")
-        # X_raw is unscaled but post-VarianceThreshold
-        kfold_models, oof_preds, kfold_weights, kfold_val_f1 = kfold_tree_ensemble(
-            X_raw, y, well_ids, verbose=True
-        )
-        print(f"    K折平均 ValF1={np.mean(kfold_val_f1):.4f} ± {np.std(kfold_val_f1):.4f}")
+    print("\n[4] 训练 K折树集成 ...")
+    kfold_models, oof_preds, kfold_weights, kfold_val_f1, kfold_scaler = kfold_tree_ensemble(
+        X_raw, y, well_ids, verbose=True
+    )
+    print(f"    K折平均 ValF1={np.mean(kfold_val_f1):.4f} ± {np.std(kfold_val_f1):.4f}")
 
+    # ---- 可选: 两阶段 DL (仅 --two-stage 时启用) ----
+    if v4_mode:
         print("\n[V4] 训练两阶段 DL ...")
         n_features = X_raw.shape[1]
         two_stage = TwoStagePipeline(
@@ -471,10 +472,10 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None,
         'hyperparams': hp,
         'dl_window_size': hp['dl_window_size'],
         'dl_model_types': trained_types,
-        # v4
         'kfold_models': kfold_models,
         'kfold_weights': kfold_weights,
         'kfold_val_f1': kfold_val_f1,
+        'kfold_scaler': kfold_scaler,
         'two_stage_pipeline': two_stage_pipeline,
         'two_stage_val_f1': two_stage_val_f1,
     }
@@ -555,24 +556,39 @@ def predict_ml_only(assets, test_features):
 
 
 def predict_ml_only_dp(assets, test_features):
-    """仅树模型集成（带 DP 后处理）"""
-    scaler = assets['scaler']
+    """仅树模型集成（带 DP 后处理）—— 优先使用 K-fold 预测"""
     feature_cols = assets['feature_cols']
-    final_weights = assets['final_weights']
 
-    ml_weights = {k: v for k, v in final_weights.items() if k in assets['tree_models']}
-    if sum(ml_weights.values()) > 0:
-        total = sum(ml_weights.values())
-        ml_weights = {k: v/total for k, v in ml_weights.items()}
+    kfold_models = assets.get('kfold_models')
+    kfold_weights = assets.get('kfold_weights')
 
-    test_X = np.nan_to_num(test_features[feature_cols].values, nan=0.0)
-    test_X_scaled = scaler.transform(test_X)
+    if kfold_models is not None and kfold_weights is not None:
+        # 使用 K-fold 预测（更稳定）
+        test_feat_array = np.nan_to_num(test_features[feature_cols].values, nan=0.0)
+        kfold_scaler = assets.get('kfold_scaler')
+        tree_proba, per_model = kfold_predict_proba(
+            kfold_models, test_feat_array, kfold_weights, scaler=kfold_scaler
+        )
+        tree_preds = per_model
+        dp_weights = kfold_weights
+    else:
+        # 回退到单次划分模型
+        scaler = assets['scaler']
+        test_X = np.nan_to_num(test_features[feature_cols].values, nan=0.0)
+        test_X_scaled = scaler.transform(test_X)
+        final_weights = assets['final_weights']
 
-    tree_preds = {}
-    for name in ml_weights:
-        tree_preds[name] = assets['tree_models'][name].predict_proba(test_X_scaled)
+        ml_weights = {k: v for k, v in final_weights.items() if k in assets['tree_models']}
+        if sum(ml_weights.values()) > 0:
+            total = sum(ml_weights.values())
+            ml_weights = {k: v/total for k, v in ml_weights.items()}
 
-    return advanced_post_process(test_features, tree_preds, {}, ml_weights)
+        tree_preds = {}
+        for name in ml_weights:
+            tree_preds[name] = assets['tree_models'][name].predict_proba(test_X_scaled)
+        dp_weights = ml_weights
+
+    return advanced_post_process(test_features, tree_preds, {}, dp_weights)
 
 
 def predict_dl_only_dp(assets, test_features, model_name):
@@ -595,30 +611,43 @@ def predict_ml_ensemble_dp(assets, test_features):
 
 
 def predict_on_test(assets, test_features):
-    """完整大混合 + DP 后处理"""
-    scaler = assets['scaler']
+    """完整大混合 + DP 后处理 —— 优先使用 K-fold"""
     feature_cols = assets['feature_cols']
-    final_weights = assets['final_weights']
-    dl_model_types = assets.get('dl_model_types', [])
-    ws = assets.get('dl_window_size', 51)
 
-    test_X = np.nan_to_num(test_features[feature_cols].values, nan=0.0)
-    test_X_scaled = scaler.transform(test_X)
+    kfold_models = assets.get('kfold_models')
+    kfold_weights = assets.get('kfold_weights')
 
-    tree_preds = {}
-    for name, model in assets['tree_models'].items():
-        if name in final_weights:
-            tree_preds[name] = model.predict_proba(test_X_scaled)
+    if kfold_models is not None and kfold_weights is not None:
+        # 使用 K-fold 树集成 + DP
+        test_feat_array = np.nan_to_num(test_features[feature_cols].values, nan=0.0)
+        kfold_scaler = assets.get('kfold_scaler')
+        tree_proba, per_model = kfold_predict_proba(
+            kfold_models, test_feat_array, kfold_weights, scaler=kfold_scaler
+        )
+        return advanced_post_process(test_features, per_model, {}, kfold_weights)
+    else:
+        # 回退到单次划分模型
+        scaler = assets['scaler']
+        final_weights = assets['final_weights']
+        test_X = np.nan_to_num(test_features[feature_cols].values, nan=0.0)
+        test_X_scaled = scaler.transform(test_X)
 
-    dl_preds = {}
-    for mtype in dl_model_types:
-        if mtype in final_weights:
-            dl_preds[mtype] = predict_enhanced_proba(
-                assets['dl_models'][mtype], test_X_scaled,
-                test_features['well_id'].values, ws
-            )
+        tree_preds = {}
+        for name, model in assets['tree_models'].items():
+            if name in final_weights:
+                tree_preds[name] = model.predict_proba(test_X_scaled)
 
-    return advanced_post_process(test_features, tree_preds, dl_preds, final_weights)
+        dl_preds = {}
+        dl_model_types = assets.get('dl_model_types', [])
+        ws = assets.get('dl_window_size', 51)
+        for mtype in dl_model_types:
+            if mtype in final_weights:
+                dl_preds[mtype] = predict_enhanced_proba(
+                    assets['dl_models'][mtype], test_X_scaled,
+                    test_features['well_id'].values, ws
+                )
+
+        return advanced_post_process(test_features, tree_preds, dl_preds, final_weights)
 
 
 # =====================================================================
@@ -957,7 +986,7 @@ def main():
     parser.add_argument('--tuned', type=str, default=None,
                         help='使用调参结果 (optuna/ray)，从 tune_results/<name>_best_params.json 加载')
     parser.add_argument('--v4', action='store_true',
-                        help='v4 模式：K折树集成 + 两阶段DL + DP v2')
+                        help='实验模式：额外训练两阶段DL + DP v2（K-fold已默认启用）')
     args = parser.parse_args()
 
     t_start = time.time()
@@ -1100,17 +1129,21 @@ def main():
 
     # ============ 最终大混合模型 ============
     print(f"\n{'─'*75}")
-    print(f"  📊 最终大混合模型 (所有模型加权融合)")
+    print(f"  📊 最终大混合模型 (K-fold 树集成 + DP)")
     print(f"{'─'*75}")
+    # 大混合使用 predict_on_test, 优先用 K-fold
+    pred_full_dp = predict_on_test(assets, test_features)
+    full_dp_tol = macro_f1_with_tolerance(y_true, pred_full_dp, well_ids_test)
+    print(f"  {'大混合-带DP(K-fold)':>32}  {full_dp_tol:>13.4f}")
+    if assets.get('kfold_val_f1'):
+        print(f"  {'K-fold CV平均F1':>32}  {np.mean(assets['kfold_val_f1']):>13.4f}")
 
+    # 不考虑权重的大混合（等权重 XGB + LGB）
     pred_full = predict_weighted_ensemble(assets, test_features)
     full_tol_f1 = macro_f1_with_tolerance(y_true, pred_full, well_ids_test)
     full_std_f1 = f1_score(y_true, pred_full, average='macro', zero_division=0)
     full_w_f1   = f1_score(y_true, pred_full, average='weighted', zero_division=0)
-    print(f"  {'大混合-不带DP':>32}  {full_tol_f1:>13.4f}")
-    pred_full_dp = predict_on_test(assets, test_features)
-    full_dp_tol = macro_f1_with_tolerance(y_true, pred_full_dp, well_ids_test)
-    print(f"  {'大混合-带DP':>32}  {full_dp_tol:>13.4f}")
+    print(f"  {'大混合-不带DP(加权)':>32}  {full_tol_f1:>13.4f}")
 
     full_scores = {
         'tol_f1': full_tol_f1, 'std_f1': full_std_f1, 'w_f1': full_w_f1,
@@ -1119,24 +1152,19 @@ def main():
         'pred': pred_full, 'pred_dp': pred_full_dp,
     }
 
-    # ============ V4 模式评分（如果启用） ============
+    # ============ 两阶段 DL 评分（仅 --v4 时启用） ============
     v4_tol_f1 = None
     v4_pred = None
-    if args.v4:
+    if args.v4 and assets.get('two_stage_pipeline'):
         print(f"\n{'─'*75}")
-        print(f"  📊 V4 增强模型 (K折 + 两阶段DL + DP v2)")
+        print(f"  📊 两阶段 DL 实验")
         print(f"{'─'*75}")
         v4_pred = v4_predict_on_test(
             assets, test_features,
-            two_stage_pipeline=assets.get('two_stage_pipeline')
+            two_stage_pipeline=assets['two_stage_pipeline']
         )
         v4_tol_f1 = macro_f1_with_tolerance(y_true, v4_pred, well_ids_test)
-        v4_std_f1 = f1_score(y_true, v4_pred, average='macro', zero_division=0)
-        v4_w_f1   = f1_score(y_true, v4_pred, average='weighted', zero_division=0)
-        print(f"  {'V4-带DP':>32}  {v4_tol_f1:>13.4f}   {v4_std_f1:>13.4f}   {v4_w_f1:>13.4f}")
-        if assets.get('kfold_val_f1'):
-            mean_cv = np.mean(assets['kfold_val_f1'])
-            print(f"  {'K-fold CV平均F1':>32}  {mean_cv:>13.4f}")
+        print(f"  {'两阶段DL+DP':>32}  {v4_tol_f1:>13.4f}")
         if assets.get('two_stage_val_f1'):
             print(f"  {'两阶段DL验证F1':>32}  {assets['two_stage_val_f1']:>13.4f}")
 
@@ -1150,27 +1178,26 @@ def main():
         print(f"  {m_name:>32}  {per_model_scores[m_key]['tol_f1']:>13.4f}")
     print(f"  {'混合ML模型(ML-only)':>32}  {ml_tol_f1:>13.4f}")
     print(f"  {'混合深度(V3)':>32}  {dl_tol:>13.4f}")
-    print(f"  {'最终大混合模型(全模型)':>32}  {full_tol_f1:>13.4f}")
+    print(f"  {'K-fold+DP(大混合)':>32}  {full_dp_tol:>13.4f}")
     if v4_tol_f1 is not None:
-        print(f"  {'V4 (K折+两阶段+DPv2)':>32}  {v4_tol_f1:>13.4f}")
-        print(f"  {'V4 vs 大混合 差异':>32}  {v4_tol_f1 - full_dp_tol:>+13.4f}")
-        print(f"  {'V4 vs 混合ML-DP 差异':>32}  {v4_tol_f1 - ml_dp_tol:>+13.4f}")
-    print(f"  {'大混合 vs 混合ML 差异':>32}  {full_tol_f1 - ml_tol_f1:>+13.4f}")
-    print(f"  {'大混合 vs 混合深度 差异':>32}  {full_tol_f1 - dl_tol:>+13.4f}")
-    print(f"  {'混合深度 vs 混合ML 差异':>32}  {dl_tol - ml_tol_f1:>+13.4f}")
+        print(f"  {'两阶段DL实验':>32}  {v4_tol_f1:>13.4f}")
+        print(f"  {'两阶段DL vs 大混合':>32}  {v4_tol_f1 - full_dp_tol:>+13.4f}")
+    print(f"  {'大混合(带DP) vs 混合ML-DP':>32}  {full_dp_tol - ml_dp_tol:>+13.4f}")
+    print(f"  {'大混合(带DP) vs 混合ML 差异':>32}  {full_dp_tol - ml_tol_f1:>+13.4f}")
+    print(f"  {'大混合(带DP) vs 混合深度':>32}  {full_dp_tol - dl_tol:>+13.4f}")
     print(f"{'='*75}")
 
     # ============ 验证要求 ============
     print(f"\n{'='*50}")
     best_individual = max(per_model_scores.values(), key=lambda x: x['tol_f1'])
     print(f"  最佳独立模型: {best_individual['tol_f1']:.4f}")
-    print(f"  混合ML:       {ml_tol_f1:.4f}")
+    print(f"  混合ML(DP):   {ml_dp_tol:.4f}")
     print(f"  混合深度(V3): {dl_tol:.4f}")
-    print(f"  大混合:       {full_tol_f1:.4f}")
+    print(f"  大混合(K-fold+DP): {full_dp_tol:.4f}")
 
     checks = []
-    checks.append(("大混合 > 最佳独立", full_tol_f1 >= best_individual['tol_f1']))
-    checks.append(("大混合 > 混合ML",   full_tol_f1 >= ml_tol_f1))
+    checks.append(("大混合(DP) > 最佳独立", full_dp_tol >= best_individual['tol_f1']))
+    checks.append(("大混合(DP) > 混合ML(DP)", full_dp_tol >= ml_dp_tol))
     checks.append(("大混合 > 混合深度", full_tol_f1 >= dl_tol))
     # V3 混合深度应强于 LSTM-Only 和 Transformer-Only
     if 'lstm_only' in per_model_scores and 'transformer_only' in per_model_scores:

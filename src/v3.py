@@ -410,8 +410,10 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
     val_f1_list = []
 
     default_xgb = {
-        'n_estimators': 500, 'max_depth': 16, 'learning_rate': 0.05,
+        'n_estimators': 400, 'max_depth': 10, 'learning_rate': 0.05,
         'subsample': 0.8, 'colsample_bytree': 0.8,
+        'min_child_weight': 5, 'gamma': 2.0,
+        'reg_lambda': 2.0, 'reg_alpha': 2.0,
         'eval_metric': 'mlogloss', 'use_label_encoder': False,
         'random_state': random_seed, 'verbosity': 0, 'n_jobs': -1,
         'early_stopping_rounds': 20,
@@ -419,19 +421,26 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
     default_xgb.update(tree_params.get('xgb', {}))
 
     default_lgb = {
-        'n_estimators': 500, 'num_leaves': 31, 'learning_rate': 0.05,
+        'n_estimators': 400, 'num_leaves': 31, 'learning_rate': 0.05,
         'subsample': 0.8, 'colsample_bytree': 0.8,
-        'class_weight': {0: 1, 1: 128, 2: 192, 3: 512},
+        'min_child_samples': 20,
+        'reg_lambda': 2.0, 'reg_alpha': 1.0,
+        'class_weight': {0: 1, 1: 40, 2: 60, 3: 100},
         'random_state': random_seed, 'verbose': -1, 'n_jobs': -1,
     }
     default_lgb.update(tree_params.get('lgb', {}))
 
     default_cat = {
-        'n_estimators': 500, 'depth': 11, 'learning_rate': 0.05,
-        'class_weights': {0: 1, 1: 128, 2: 192, 3: 512},
+        'n_estimators': 400, 'depth': 8, 'learning_rate': 0.05,
+        'l2_leaf_reg': 3.0,
+        'class_weights': {0: 1, 1: 40, 2: 60, 3: 100},
         'random_seed': random_seed, 'verbose': False,
     }
     default_cat.update(tree_params.get('cat', {}))
+
+    # 全局归一化（所有 fold 共用同一个 scaler，保持预测一致性）
+    global_scaler = StandardScaler()
+    X_train_scaled = global_scaler.fit_transform(X_train)
 
     for fold, (train_well_idx, val_well_idx) in enumerate(skf.split(well_ids_unique, strat_labels)):
         train_wells = well_ids_unique[train_well_idx]
@@ -440,13 +449,11 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
         train_rows = np.concatenate([well_to_rows[w] for w in train_wells])
         val_rows = np.concatenate([well_to_rows[w] for w in val_wells])
 
-        X_tr, y_tr = X_train[train_rows], y_train[train_rows]
-        X_val, y_val = X_train[val_rows], y_train[val_rows]
+        X_tr_s = X_train_scaled[train_rows]
+        y_tr = y_train[train_rows]
+        X_val_s = X_train_scaled[val_rows]
+        y_val = y_train[val_rows]
         wid_val = well_ids_train[val_rows]
-
-        scale = StandardScaler()
-        X_tr_s = scale.fit_transform(X_tr)
-        X_val_s = scale.transform(X_val)
 
         # XGBoost
         model_xgb = xgb.XGBClassifier(**default_xgb)
@@ -521,19 +528,22 @@ def kfold_tree_ensemble(X_train, y_train, well_ids_train,
               f"cat={best['cat']:.1f} → OOF F1={best_f1:.4f}")
         print(f"    [K-Fold] 平均验证 F1={np.mean(val_f1_list):.4f} ± {np.std(val_f1_list):.4f}")
 
-    return cv_models, oof_preds_4c, best, val_f1_list
+    return cv_models, oof_preds_4c, best, val_f1_list, global_scaler
 
 
-def kfold_predict_proba(cv_models, X_test, weights):
+def kfold_predict_proba(cv_models, X_test, weights, scaler=None):
     """
     对测试集使用 K 折模型平均预测。
     weights: {'xgb': w, 'lgb': w, 'cat': w} — OOF 调优后的权重
+    scaler: 训练时使用的 StandardScaler（来自 kfold_tree_ensemble）
     Return: (blended_proba [n, 4], per_model_probas dict)
     """
     preds = {}
     blended = np.zeros((X_test.shape[0], 4))
-    scaler = StandardScaler()
-    X_test_s = scaler.fit_transform(X_test)
+    if scaler is not None:
+        X_test_s = scaler.transform(X_test)
+    else:
+        X_test_s = StandardScaler().fit_transform(X_test)
 
     for name in ['xgb', 'lgb', 'cat']:
         models = cv_models.get(name, [])
@@ -567,7 +577,10 @@ def v4_predict_on_test(assets, test_features, two_stage_pipeline=None):
     # K-fold tree predictions
     if kfold_models is not None:
         test_feat_array = test_features[assets['feature_cols']].values
-        blended, per_model = kfold_predict_proba(kfold_models, test_feat_array, kfold_weights)
+        kfold_scaler = assets.get('kfold_scaler')
+        blended, per_model = kfold_predict_proba(
+            kfold_models, test_feat_array, kfold_weights, scaler=kfold_scaler
+        )
         tree_preds = per_model
         tree_proba = blended
         # 使用 K-fold 权重作为 DP 的 weights
