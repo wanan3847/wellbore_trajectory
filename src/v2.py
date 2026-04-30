@@ -732,8 +732,8 @@ def advanced_post_process(test_features, tree_preds, dl_preds, weights):
 
 def dp_post_process_v2(well_data, model_proba, prior_info=None,
                        detection_scores=None,
-                       candidates_per_class=50, dp_search_width=30,
-                       min_spacing=10, kp3_min_spacing=5,
+                       candidates_per_class=80, dp_search_width=50,
+                       min_spacing=8, kp3_min_spacing=3,
                        phys_weight=0.15, prior_weight=0.15,
                        detection_weight=0.2):
     """
