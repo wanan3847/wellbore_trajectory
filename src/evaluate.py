@@ -57,7 +57,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from v2 import (
     Config, create_advanced_features_v2, sample_hard_negatives,
     macro_f1_with_tolerance, advanced_post_process,
-    advanced_post_process_v2, dp_post_process
+    advanced_post_process_v2, dp_post_process,
+    optimize_dp_params
 )
 from dl_improved import (
     DrillingWindowDataset,
@@ -169,6 +170,31 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None,
     # --- 特征工程 ---
     print("[1] 特征工程 ...")
     train_features = create_advanced_features_v2(train_df, is_train=True)
+
+    # --- 可选: KP3 数据增强 (仅 v4_mode) ---
+    if v4_mode and 'label' in train_features.columns:
+        print("\n[V4] KP3 数据增强 ...")
+        kp3_before = int((train_features['label'] == 3).sum())
+        exclude = ['id', 'well_id', 'label']
+        feat_cols_aug = [c for c in train_features.columns if c not in exclude]
+        X_aug, y_aug, wid_aug = augment_kp3(
+            train_features[feat_cols_aug].values,
+            train_features['label'].values,
+            train_features['well_id'].values,
+            n_shift=3, noise_std=0.01
+        )
+        kp3_after = int((y_aug == 3).sum())
+        print(f"    KP3 样本: {kp3_before} → {kp3_after} (+{kp3_after - kp3_before})")
+        aug_df = pd.DataFrame(X_aug, columns=feat_cols_aug)
+        aug_df['label'] = y_aug
+        aug_df['well_id'] = wid_aug
+        if 'id' in train_features.columns:
+            n_orig = len(train_features)
+            aug_df['id'] = np.concatenate([
+                train_features['id'].values,
+                np.full(len(aug_df) - n_orig, -1, dtype=np.int64)
+            ])
+        train_features = aug_df
 
     # --- 负采样 ---
     print("[2] 困难负样本采样 ...")
@@ -444,7 +470,24 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None,
     )
     print(f"    K折平均 ValF1={np.mean(kfold_val_f1):.4f} ± {np.std(kfold_val_f1):.4f}")
 
-    # ---- 可选: 两阶段 DL (仅 --two-stage 时启用) ----
+    # ---- DP 参数网格搜索 (仅 v4_mode) ----
+    best_dp_params = None
+    dp_grid_score = None
+    if v4_mode:
+        print("\n[V4] DP 参数网格搜索...")
+        val_features_df = train_sampled[val_mask].copy().reset_index(drop=True)
+        val_tree_preds = {}
+        for name in ['xgb', 'lgb', 'cat']:
+            if name in val_scores and val_scores[name] > 0.1:
+                val_tree_preds[name] = tree_models[name].predict_proba(X_val_scaled)
+        best_dp_params, dp_grid_score, _ = optimize_dp_params(
+            val_features_df, val_tree_preds,
+            y_val, well_ids_val,
+            verbose=True
+        )
+        print(f"  → 最佳 DP 参数: {best_dp_params}, 验证 F1={dp_grid_score:.4f}")
+
+    # ---- 可选: 两阶段 DL (仅 v4_mode) ----
     if v4_mode:
         print("\n[V4] 训练两阶段 DL ...")
         n_features = X_raw.shape[1]
@@ -476,6 +519,8 @@ def train_pipeline(train_df, hyperparams=None, dl_model_types=None,
         'kfold_weights': kfold_weights,
         'kfold_val_f1': kfold_val_f1,
         'kfold_scaler': kfold_scaler,
+        'best_dp_params': best_dp_params,
+        'dp_grid_score': dp_grid_score,
         'two_stage_pipeline': two_stage_pipeline,
         'two_stage_val_f1': two_stage_val_f1,
     }
@@ -558,6 +603,7 @@ def predict_ml_only(assets, test_features):
 def predict_ml_only_dp(assets, test_features):
     """仅树模型集成（带 DP 后处理）—— 优先使用 K-fold 预测"""
     feature_cols = assets['feature_cols']
+    best_dp_params = assets.get('best_dp_params')
 
     kfold_models = assets.get('kfold_models')
     kfold_weights = assets.get('kfold_weights')
@@ -588,7 +634,10 @@ def predict_ml_only_dp(assets, test_features):
             tree_preds[name] = assets['tree_models'][name].predict_proba(test_X_scaled)
         dp_weights = ml_weights
 
-    return advanced_post_process_v2(test_features, tree_preds, {}, dp_weights)
+    # 使用最佳 DP 参数（如果存在）
+    dp_kwargs = best_dp_params or {}
+    return advanced_post_process_v2(test_features, tree_preds, {}, dp_weights,
+                                    **dp_kwargs)
 
 
 def predict_dl_only_dp(assets, test_features, model_name):
@@ -611,8 +660,10 @@ def predict_ml_ensemble_dp(assets, test_features):
 
 
 def predict_on_test(assets, test_features):
-    """完整大混合 + DP 后处理 —— 优先使用 K-fold"""
+    """完整大混合 + DP 后处理 —— 优先使用 K-fold，使用 best_dp_params"""
     feature_cols = assets['feature_cols']
+    best_dp_params = assets.get('best_dp_params')
+    dp_kwargs = best_dp_params or {}
 
     kfold_models = assets.get('kfold_models')
     kfold_weights = assets.get('kfold_weights')
@@ -624,7 +675,8 @@ def predict_on_test(assets, test_features):
         tree_proba, per_model = kfold_predict_proba(
             kfold_models, test_feat_array, kfold_weights, scaler=kfold_scaler
         )
-        return advanced_post_process_v2(test_features, per_model, {}, kfold_weights)
+        return advanced_post_process_v2(test_features, per_model, {}, kfold_weights,
+                                        **dp_kwargs)
     else:
         # 回退到单次划分模型
         scaler = assets['scaler']
@@ -647,7 +699,8 @@ def predict_on_test(assets, test_features):
                     test_features['well_id'].values, ws
                 )
 
-        return advanced_post_process_v2(test_features, tree_preds, dl_preds, final_weights)
+        return advanced_post_process_v2(test_features, tree_preds, dl_preds, final_weights,
+                                        **dp_kwargs)
 
 
 # =====================================================================
@@ -1152,21 +1205,31 @@ def main():
         'pred': pred_full, 'pred_dp': pred_full_dp,
     }
 
-    # ============ 两阶段 DL 评分（仅 --v4 时启用） ============
+    # ============ V4 信息（仅 --v4 时启用） ============
     v4_tol_f1 = None
     v4_pred = None
-    if args.v4 and assets.get('two_stage_pipeline'):
+    if args.v4:
         print(f"\n{'─'*75}")
-        print(f"  📊 两阶段 DL 实验")
+        print(f"  📊 V4 实验")
         print(f"{'─'*75}")
-        v4_pred = v4_predict_on_test(
-            assets, test_features,
-            two_stage_pipeline=assets['two_stage_pipeline']
-        )
-        v4_tol_f1 = macro_f1_with_tolerance(y_true, v4_pred, well_ids_test)
-        print(f"  {'两阶段DL+DP':>32}  {v4_tol_f1:>13.4f}")
-        if assets.get('two_stage_val_f1'):
-            print(f"  {'两阶段DL验证F1':>32}  {assets['two_stage_val_f1']:>13.4f}")
+        # DP 网格搜索信息
+        best_dp_params = assets.get('best_dp_params')
+        dp_grid_score = assets.get('dp_grid_score')
+        if best_dp_params:
+            print(f"  DP 网格搜索最佳参数: {best_dp_params}")
+            print(f"  DP 网格搜索验证 F1: {dp_grid_score:.4f}")
+
+        # 两阶段 DL
+        if assets.get('two_stage_pipeline'):
+            v4_pred = v4_predict_on_test(
+                assets, test_features,
+                two_stage_pipeline=assets['two_stage_pipeline'],
+                best_dp_params=best_dp_params
+            )
+            v4_tol_f1 = macro_f1_with_tolerance(y_true, v4_pred, well_ids_test)
+            print(f"  {'两阶段DL+DP':>32}  {v4_tol_f1:>13.4f}")
+            if assets.get('two_stage_val_f1'):
+                print(f"  {'两阶段DL验证F1':>32}  {assets['two_stage_val_f1']:>13.4f}")
 
     # ============ 对比汇总 ============
     print(f"\n{'='*75}")

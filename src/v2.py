@@ -862,9 +862,10 @@ def dp_post_process_v2(well_data, model_proba, prior_info=None,
 
 
 def advanced_post_process_v2(test_features, tree_preds, dl_preds, weights,
-                              detection_scores=None):
+                              detection_scores=None, **dp_kwargs):
     """
     增强版后处理 v2 — 使用 dp_post_process_v2
+    dp_kwargs: 可传入 candidates_per_class, min_spacing, kp3_min_spacing, dp_search_width 等
     """
     print("\n[9/9] 增强后处理 v2 ...")
 
@@ -898,7 +899,8 @@ def advanced_post_process_v2(test_features, tree_preds, dl_preds, weights,
 
         best_combo = dp_post_process_v2(
             group, group_proba, prior_keypoints,
-            detection_scores=group_det
+            detection_scores=group_det,
+            **dp_kwargs
         )
 
         for kp, idx in best_combo.items():
@@ -907,6 +909,112 @@ def advanced_post_process_v2(test_features, tree_preds, dl_preds, weights,
                 final_predictions[global_idx] = kp
 
     return final_predictions
+
+
+# ==================== 6c. DP参数网格搜索 ====================
+
+def optimize_dp_params(val_features_df, tree_preds_dict, y_val, well_ids_val,
+                       param_grid=None, ensemble_weights=None, verbose=True):
+    """
+    DP v2 参数网格搜索 — 用验证集找最优候选数/间距/搜索宽度组合。
+
+    Args:
+        val_features_df: 验证集 DataFrame (含 well_id, JX 等物理列)
+        tree_preds_dict: {'xgb': [n,4], 'lgb': [n,4], 'cat': [n,4]} 模型概率
+        y_val: 真实标签
+        well_ids_val: 井号
+        param_grid: 参数字典，默认全搜索
+        ensemble_weights: 模型融合权重，默认等权重
+
+    Returns:
+        best_params, best_score, all_results
+    """
+    if param_grid is None:
+        param_grid = {
+            'candidates_per_class': [30, 50, 80, 120],
+            'min_spacing': [5, 8, 10, 12, 15],
+            'kp3_min_spacing': [3, 5, 8, 10],
+            'dp_search_width': [20, 30, 50],
+        }
+
+    # 计算加权融合概率
+    if ensemble_weights is None:
+        n_models = len(tree_preds_dict)
+        ensemble_weights = {k: 1.0 / n_models for k in tree_preds_dict}
+
+    final_proba = np.zeros((len(val_features_df), 4))
+    for name, proba in tree_preds_dict.items():
+        w = ensemble_weights.get(name, 0)
+        if w > 0:
+            final_proba += proba * w
+
+    # 预计算每井的先验信息（只需一次）
+    prior_info_by_well = {}
+    for well_id in val_features_df['well_id'].unique():
+        mask = val_features_df['well_id'] == well_id
+        group = val_features_df[mask].reset_index(drop=True)
+        prior = {}
+        for kp in [1, 2, 3]:
+            col = f'dist_to_prior_kp{kp}'
+            if col in group.columns:
+                dists = group[col].values
+                if dists.min() < 900:
+                    prior[kp] = int(dists.argmin())
+        prior_info_by_well[well_id] = prior
+
+    # 生成所有参数组合
+    keys = list(param_grid.keys())
+    grids = [param_grid[k] for k in keys]
+
+    from itertools import product
+    all_combos = list(product(*grids))
+    total = len(all_combos)
+    if verbose:
+        print(f"\n[DP Grid Search] 共 {total} 种参数组合")
+
+    best_score = -1.0
+    best_params = None
+    all_results = []
+
+    for combo_idx, combo in enumerate(all_combos):
+        params = dict(zip(keys, combo))
+        preds = np.zeros(len(val_features_df), dtype=int)
+
+        for well_id in val_features_df['well_id'].unique():
+            mask = val_features_df['well_id'] == well_id
+            group = val_features_df[mask].reset_index(drop=True)
+            indices = np.where(mask)[0]
+            group_proba = final_proba[indices]
+
+            best_combo = dp_post_process_v2(
+                group, group_proba,
+                prior_info=prior_info_by_well.get(well_id),
+                candidates_per_class=params['candidates_per_class'],
+                dp_search_width=params['dp_search_width'],
+                min_spacing=params['min_spacing'],
+                kp3_min_spacing=params['kp3_min_spacing'],
+            )
+
+            for kp, idx in best_combo.items():
+                if 0 <= idx < len(group):
+                    global_idx = indices[idx]
+                    preds[global_idx] = kp
+
+        score = macro_f1_with_tolerance(y_val, preds, well_ids_val)
+        all_results.append((params, score))
+
+        if score > best_score:
+            best_score = score
+            best_params = params
+
+        if verbose and (combo_idx + 1) % 20 == 0:
+            print(f"  [DP Grid] {combo_idx+1}/{total}: 当前最佳 F1={best_score:.4f}")
+
+    if verbose:
+        print(f"\n  [DP Grid] 最佳参数: {best_params}")
+        print(f"  [DP Grid] 最佳验证 F1={best_score:.4f}")
+
+    return best_params, best_score, all_results
 
 
 # ==================== 数据库交互模块 ====================

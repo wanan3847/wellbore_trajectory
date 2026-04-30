@@ -341,12 +341,19 @@ class TwoStagePipeline:
     def predict(self, X_test, well_ids_test):
         """
         推理：检测器 gating 分类器
-        Returns: (detection_probas [n], class_probas [n, 4])
+        DrillingWindowDataset 内部按 well_id 排序，这里还原回原始顺序。
+        Returns: (detection_probas [n], gated_class_probas [n, 4])
+                 gated_class_probas = cls_probas 经检测概率加权（仅类1/2/3）
         """
         self.detector.eval()
         self.classifier.eval()
 
-        ds = DrillingWindowDataset(X_test, y=None, well_ids=well_ids_test, window_size=self.window_size)
+        # 记录排序并保存逆映射，确保返回原始顺序
+        sort_idx = np.argsort(well_ids_test, kind='stable')
+        reverse_sort = np.argsort(sort_idx)
+
+        ds = DrillingWindowDataset(X_test, y=None, well_ids=well_ids_test,
+                                   window_size=self.window_size)
         ld = DataLoader(ds, batch_size=256)
 
         det_probas = []
@@ -356,17 +363,24 @@ class TwoStagePipeline:
                 data = bx[0] if isinstance(bx, list) else bx
                 data = data.to(DEVICE)
 
-                # 检测器输出
                 det_logits = self.detector(data)
                 det_probs = F.softmax(det_logits.view(-1, 2), dim=1)[:, 1].cpu().numpy()
                 det_probas.append(det_probs)
 
-                # 分类器输出
                 cls_logits = self.classifier(data)
                 cls_probs = F.softmax(cls_logits, dim=1).cpu().numpy()
                 cls_probas.append(cls_probs)
 
-        return np.concatenate(det_probas), np.vstack(cls_probas)
+        det_probas = np.concatenate(det_probas)[reverse_sort]
+        cls_probas = np.vstack(cls_probas)[reverse_sort]
+
+        # Gating：只保留检测器认为可能是关键点的位置的高分类置信度
+        gated = cls_probas.copy()
+        for cls in [1, 2, 3]:
+            gated[:, cls] = cls_probas[:, cls] * det_probas
+        # 类0不变（非关键点置信度不变）
+
+        return det_probas, gated
 
 
 # ==================== K折树模型集成 ====================
@@ -564,10 +578,11 @@ def kfold_predict_proba(cv_models, X_test, weights, scaler=None):
 
 # ==================== v4 预测流水线 ====================
 
-def v4_predict_on_test(assets, test_features, two_stage_pipeline=None):
+def v4_predict_on_test(assets, test_features, two_stage_pipeline=None,
+                       best_dp_params=None):
     """
-    v4 流水线：K-fold tree ensemble + 原始 DP
-    两阶段 DL 效果太差（F1≈0.25），暂时去掉避免拖累。
+    v4 流水线：K-fold tree ensemble + 两阶段 DL 检测门控 + DP v2
+    使用检测器概率作为辅助信号传递给 DP，实现软门控。
     """
     kfold_models = assets.get('kfold_models')
     kfold_weights = assets.get('kfold_weights')
@@ -582,11 +597,8 @@ def v4_predict_on_test(assets, test_features, two_stage_pipeline=None):
             kfold_models, test_feat_array, kfold_weights, scaler=kfold_scaler
         )
         tree_preds = per_model
-        tree_proba = blended
-        # 使用 K-fold 权重作为 DP 的 weights
         dp_weights = kfold_weights
     else:
-        # Fallback to existing tree preds
         scaler = assets.get('scaler')
         test_scaled = scaler.transform(test_features[assets['feature_cols']].values)
         for name in ['xgb', 'lgb', 'cat']:
@@ -594,14 +606,27 @@ def v4_predict_on_test(assets, test_features, two_stage_pipeline=None):
                 proba = assets['tree_models'][name].predict_proba(test_scaled)
                 tree_preds[name] = proba
         dp_weights = assets.get('final_weights', {})
-        tree_proba = np.zeros((len(test_features), 4))
-        for name in ['xgb', 'lgb', 'cat']:
-            if name in tree_preds and tree_preds[name] is not None and name in dp_weights:
-                tree_proba += tree_preds[name] * dp_weights[name]
 
-    # 使用原始 DP (v1) 后处理 — 已验证能提升 +0.134
-    final_pred = advanced_post_process(
-        test_features, tree_preds, dl_preds, dp_weights
+    # 两阶段 DL 检测门控
+    detection_scores = None
+    if two_stage_pipeline is not None:
+        test_feat_array = test_features[assets['feature_cols']].values
+        det_scores, gated_cls = two_stage_pipeline.predict(
+            test_feat_array, test_features['well_id'].values
+        )
+        detection_scores = det_scores
+        # 将 DL 门控后的概率加入 ensemble
+        dl_preds['two_stage'] = gated_cls
+        # DL 验证 F1 用于确定权重
+        dl_val_f1 = max(assets.get('two_stage_val_f1', 0.1), 0.1)
+        dp_weights['two_stage'] = dl_val_f1
+
+    # 使用 DP v2 后处理（含 detection_scores 辅助信号 + 最佳 DP 参数）
+    dp_kwargs = best_dp_params or {}
+    final_pred = advanced_post_process_v2(
+        test_features, tree_preds, dl_preds, dp_weights,
+        detection_scores=detection_scores,
+        **dp_kwargs
     )
 
     return final_pred
