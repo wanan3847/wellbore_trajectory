@@ -57,7 +57,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from v2 import (
     Config, create_advanced_features_v2, sample_hard_negatives,
     macro_f1_with_tolerance, advanced_post_process,
-    dp_post_process
+    advanced_post_process_v2, dp_post_process
 )
 from dl_improved import (
     DrillingWindowDataset,
@@ -588,7 +588,7 @@ def predict_ml_only_dp(assets, test_features):
             tree_preds[name] = assets['tree_models'][name].predict_proba(test_X_scaled)
         dp_weights = ml_weights
 
-    return advanced_post_process(test_features, tree_preds, {}, dp_weights)
+    return advanced_post_process_v2(test_features, tree_preds, {}, dp_weights)
 
 
 def predict_dl_only_dp(assets, test_features, model_name):
@@ -624,7 +624,7 @@ def predict_on_test(assets, test_features):
         tree_proba, per_model = kfold_predict_proba(
             kfold_models, test_feat_array, kfold_weights, scaler=kfold_scaler
         )
-        return advanced_post_process(test_features, per_model, {}, kfold_weights)
+        return advanced_post_process_v2(test_features, per_model, {}, kfold_weights)
     else:
         # 回退到单次划分模型
         scaler = assets['scaler']
@@ -647,7 +647,7 @@ def predict_on_test(assets, test_features):
                     test_features['well_id'].values, ws
                 )
 
-        return advanced_post_process(test_features, tree_preds, dl_preds, final_weights)
+        return advanced_post_process_v2(test_features, tree_preds, dl_preds, final_weights)
 
 
 # =====================================================================
