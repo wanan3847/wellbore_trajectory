@@ -23,7 +23,8 @@ warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from v2 import (
     Config, macro_f1_with_tolerance,
-    dp_post_process_v2, advanced_post_process_v2
+    dp_post_process_v2, advanced_post_process_v2,
+    advanced_post_process  # 原始 DP (v1)
 )
 from dl_improved import (
     DrillingWindowDataset, PositionalEncoding
@@ -555,8 +556,8 @@ def kfold_predict_proba(cv_models, X_test, weights):
 
 def v4_predict_on_test(assets, test_features, two_stage_pipeline=None):
     """
-    v4 流水线：K-fold tree ensemble + 两阶段 DL + DP v2
-    需要 assets 包含 'kfold_models', 'kfold_weights', 'kfold_val_f1'
+    v4 流水线：K-fold tree ensemble + 原始 DP
+    两阶段 DL 效果太差（F1≈0.25），暂时去掉避免拖累。
     """
     kfold_models = assets.get('kfold_models')
     kfold_weights = assets.get('kfold_weights')
@@ -569,49 +570,25 @@ def v4_predict_on_test(assets, test_features, two_stage_pipeline=None):
         blended, per_model = kfold_predict_proba(kfold_models, test_feat_array, kfold_weights)
         tree_preds = per_model
         tree_proba = blended
+        # 使用 K-fold 权重作为 DP 的 weights
+        dp_weights = kfold_weights
     else:
         # Fallback to existing tree preds
         scaler = assets.get('scaler')
         test_scaled = scaler.transform(test_features[assets['feature_cols']].values)
-        tree_proba = np.zeros((len(test_features), 4))
         for name in ['xgb', 'lgb', 'cat']:
             if name in assets.get('tree_models', {}):
                 proba = assets['tree_models'][name].predict_proba(test_scaled)
                 tree_preds[name] = proba
-        # Use existing ensemble weights
-        weights = assets.get('final_weights', {})
+        dp_weights = assets.get('final_weights', {})
         tree_proba = np.zeros((len(test_features), 4))
         for name in ['xgb', 'lgb', 'cat']:
-            if name in tree_preds and tree_preds[name] is not None and name in weights:
-                tree_proba += tree_preds[name] * weights[name]
+            if name in tree_preds and tree_preds[name] is not None and name in dp_weights:
+                tree_proba += tree_preds[name] * dp_weights[name]
 
-    # Two-stage DL predictions
-    detection_scores = None
-    if two_stage_pipeline is not None:
-        X_test_arr = test_features[assets['feature_cols']].values
-        well_ids_test = test_features['well_id'].values
-        det_probas, cls_probas = two_stage_pipeline.predict(X_test_arr, well_ids_test)
-        detection_scores = det_probas
-        dl_preds['two_stage'] = cls_probas
-
-        # Gate DL predictions with detection score
-        gate = np.clip(det_probas[:, None], 0.1, 1.0)
-        dl_weighted = cls_probas * gate
-
-        # Blend: 0.7 tree + 0.3 DL
-        final_proba = 0.7 * tree_proba + 0.3 * dl_weighted
-    else:
-        final_proba = tree_proba
-
-    # Build weights dict for DP v2 — use a single combined prediction
-    weights_combined = {'combined': 1.0}
-    tree_preds_combined = {'combined': final_proba}
-
-    # DP v2 post-processing
-    final_pred = advanced_post_process_v2(
-        test_features, tree_preds_combined, {},
-        weights_combined,
-        detection_scores=detection_scores
+    # 使用原始 DP (v1) 后处理 — 已验证能提升 +0.134
+    final_pred = advanced_post_process(
+        test_features, tree_preds, dl_preds, dp_weights
     )
 
     return final_pred
